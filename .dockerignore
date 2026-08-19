@@ -1,0 +1,12 @@
+node_modules
+web/node_modules
+.env
+web/.env
+data
+spike.mjs
+*.log
+.DS_Store
+.git
+.gitignore
+README.md
+启动.bat

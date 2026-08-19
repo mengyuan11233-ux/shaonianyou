@@ -1,0 +1,1479 @@
+{
+  "name": "shaonianyou",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "少年游 - AI 智能旅行规划（技术验证）",
+  "scripts": {
+    "spike": "node spike.mjs",
+    "start": "node server/index.js",
+    "build": "cd web && npm run build"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.67.0"
+  }
+}
+// ============================================================
+// 少年游 · 后端 HTTP 服务（Node 内置 http + SSE 流式进度）
+// 启动：npm start  （默认端口 3000，可用 PORT 覆盖）
+// ============================================================
+
+import 'dotenv/config';
+import { createServer } from 'node:http';
+import { readFile, stat } from 'node:fs/promises';
+import { join, dirname, extname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { planTrip, replanTrip } from './planner.js';
+import { loadMemory, updateMemory, memoryToPrompt } from './memory.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PORT = process.env.PORT || 3000;
+const DIST_DIR = join(__dirname, '..', 'web', 'dist');
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+};
+
+function sendSSE(res, data) {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function setCORS(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+function json(res, status, data) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(data));
+}
+
+async function readBody(req) {
+  let body = '';
+  for await (const chunk of req) body += chunk;
+  try { return JSON.parse(body || '{}'); } catch { return {}; }
+}
+
+// 提供前端静态文件（web/dist），找不到则回退到 index.html（SPA）
+async function serveStatic(req, res, pathname) {
+  if (req.method !== 'GET') return false;
+  let filePath = resolve(DIST_DIR, '.' + pathname);
+  if (!filePath.startsWith(DIST_DIR)) return false;
+  try {
+    let st = await stat(filePath);
+    if (st.isDirectory()) filePath = join(filePath, 'index.html');
+    const data = await readFile(filePath);
+    res.writeHead(200, { 'Content-Type': MIME[extname(filePath).toLowerCase()] || 'application/octet-stream' });
+    res.end(data);
+    return true;
+  } catch {
+    try {
+      const data = await readFile(join(DIST_DIR, 'index.html'));
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+const server = createServer(async (req, res) => {
+  setCORS(res);
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const path = url.pathname;
+
+  // 健康检查
+  if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true });
+
+  // 读取 / 更新 Memory
+  if (req.method === 'GET' && path === '/api/memory') return json(res, 200, loadMemory());
+  if (req.method === 'POST' && path === '/api/memory') {
+    const m = updateMemory(await readBody(req));
+    return json(res, 200, m);
+  }
+
+  // 规划（SSE 流式进度）
+  if (req.method === 'POST' && path === '/api/plan') {
+    const { request } = await readBody(req);
+    if (!request) return json(res, 400, { error: '缺少 request 字段' });
+    const memory = loadMemory();
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    try {
+      const { plan, issues } = await planTrip(request, {
+        memoryText: memoryToPrompt(memory),
+        onProgress: (e) => sendSSE(res, e),
+      });
+      sendSSE(res, { type: 'done', plan, issues });
+    } catch (err) {
+      sendSSE(res, { type: 'error', message: err.message });
+    } finally {
+      res.end();
+    }
+    return;
+  }
+
+  // 重新规划（SSE 流式进度）
+  if (req.method === 'POST' && path === '/api/replan') {
+    const { plan, message } = await readBody(req);
+    if (!plan || !message) return json(res, 400, { error: '缺少 plan 或 message 字段' });
+    const memory = loadMemory();
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    try {
+      const { plan: newPlan, issues } = await replanTrip(plan, message, {
+        memoryText: memoryToPrompt(memory),
+        onProgress: (e) => sendSSE(res, e),
+      });
+      sendSSE(res, { type: 'done', plan: newPlan, issues });
+    } catch (err) {
+      sendSSE(res, { type: 'error', message: err.message });
+    } finally {
+      res.end();
+    }
+    return;
+  }
+
+  // 静态资源（前端构建产物 web/dist）
+  if (!path.startsWith('/api/')) {
+    if (await serveStatic(req, res, path)) return;
+  }
+
+  return json(res, 404, { error: 'Not Found' });
+});
+
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 少年游后端已启动：http://localhost:${PORT}`));
+// ============================================================
+// 少年游 · Memory（长期用户偏好，JSON 文件持久化，免数据库）
+// ============================================================
+
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = join(__dirname, '..', 'data');
+const MEMORY_FILE = join(DATA_DIR, 'memory.json');
+
+const DEFAULT = {
+  userId: 'default',
+  preferences: [],   // 喜欢的旅行类型：美食/拍照打卡/咖啡...
+  dislikes: [],      // 不喜欢：早起/高强度步行...
+  budgetHabit: '',   // 预算习惯
+  travelStyle: '',   // 旅行风格：松弛休闲/特种兵...
+  visitHistory: [],  // 历史行程记录
+};
+
+export function loadMemory() {
+  try {
+    if (existsSync(MEMORY_FILE)) return { ...DEFAULT, ...JSON.parse(readFileSync(MEMORY_FILE, 'utf8')) };
+  } catch {}
+  return { ...DEFAULT };
+}
+
+export function saveMemory(m) {
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(MEMORY_FILE, JSON.stringify(m, null, 2));
+}
+
+export function updateMemory(updates = {}) {
+  const m = loadMemory();
+  if (Array.isArray(updates.preferences)) m.preferences = [...new Set([...m.preferences, ...updates.preferences])];
+  if (Array.isArray(updates.dislikes)) m.dislikes = [...new Set([...m.dislikes, ...updates.dislikes])];
+  if (updates.budgetHabit) m.budgetHabit = updates.budgetHabit;
+  if (updates.travelStyle) m.travelStyle = updates.travelStyle;
+  saveMemory(m);
+  return m;
+}
+
+export function memoryToPrompt(m) {
+  const parts = [];
+  if (m.preferences.length) parts.push(`偏好：${m.preferences.join('、')}`);
+  if (m.dislikes.length) parts.push(`不喜欢：${m.dislikes.join('、')}`);
+  if (m.budgetHabit) parts.push(`预算习惯：${m.budgetHabit}`);
+  if (m.travelStyle) parts.push(`旅行风格：${m.travelStyle}`);
+  return parts.join('；');
+}
+// ============================================================
+// 少年游 · Planner（Agent 编排层）
+// 构建提示词 → Agent 循环（工具调用）→ 解析 → 校验
+// ============================================================
+
+import 'dotenv/config';
+import OpenAI from 'openai';
+import { TOOL_SCHEMAS, dispatchTool } from './tools.js';
+import { buildSystemPrompt } from './prompts.js';
+import { extractJSON, validatePlan } from './validate.js';
+
+const LLM_KEY = process.env.LLM_API_KEY;
+const LLM_URL = process.env.LLM_BASE_URL;
+const LLM_MODEL = process.env.LLM_MODEL;
+
+const llm = new OpenAI({ apiKey: LLM_KEY, baseURL: LLM_URL });
+const MAX_ROUNDS = 25;
+
+// 核心：一次完整规划。onProgress(type, payload) 用于 SSE 推送进度。
+export async function planTrip(userRequest, { memoryText = '', onProgress = () => {} } = {}) {
+  const messages = [
+    { role: 'system', content: buildSystemPrompt(memoryText) },
+    { role: 'user', content: userRequest },
+  ];
+  onProgress({ type: 'start', message: '正在为你规划行程…' });
+
+  let totalTools = 0;
+  const TOOL_CAP = 40;
+
+  for (let round = 1; round <= MAX_ROUNDS; round++) {
+    const response = await llm.chat.completions.create({
+      model: LLM_MODEL, messages, tools: TOOL_SCHEMAS, tool_choice: 'auto', temperature: 0.3,
+    });
+    const msg = response.choices[0].message;
+    messages.push(msg);
+
+    // 无工具调用 → 规划结束，输出最终 JSON
+    if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      let plan = extractJSON(msg.content);
+      // 解析失败 → 让 LLM 重新输出合法 JSON（最多重试 2 次）
+      for (let retry = 0; retry < 2 && !plan; retry++) {
+        messages.push({ role: 'user', content: '你刚才的输出不是合法的 JSON。请只输出一个纯 JSON 对象，不要 markdown 代码块、注释或任何多余文字。' });
+        const r = await llm.chat.completions.create({ model: LLM_MODEL, messages, temperature: 0 });
+        const m2 = r.choices[0].message;
+        messages.push(m2);
+        plan = extractJSON(m2.content);
+      }
+      if (!plan) throw new Error('未能解析 LLM 输出的行程 JSON');
+      const issues = validatePlan(plan);
+      return { plan, issues };
+    }
+
+    // 执行本轮所有工具调用（超过上限则回传提示，强制让模型输出 JSON）
+    for (const tc of msg.tool_calls) {
+      let args = {};
+      let result;
+      if (totalTools >= TOOL_CAP) {
+        result = { error: '工具调用次数已达上限，请基于已有数据直接输出最终 JSON，不要再调用任何工具' };
+      } else {
+        try {
+          args = JSON.parse(tc.function.arguments);
+        } catch {
+          result = { error: '工具参数不是合法 JSON，请按 schema 重新生成参数' };
+        }
+        if (!result) {
+          onProgress({ type: 'tool', name: tc.function.name, args });
+          result = await dispatchTool(tc.function.name, args);
+          onProgress({ type: 'tool_result', name: tc.function.name, result });
+        }
+      }
+      totalTools++;
+      messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
+    }
+  }
+  throw new Error('超过最大工具调用轮次');
+}
+
+// 旅行中重新规划：基于已有行程 + 用户修改，只调整受影响部分
+export async function replanTrip(existingPlan, userMessage, opts = {}) {
+  const request = `这是你之前生成的旅行计划（JSON）：\n${JSON.stringify(existingPlan)}\n\n用户现在提出：「${userMessage}」\n请基于现有计划重新规划：保留不受影响的部分，只调整与用户修改相关的天/地点，并重新计算相关路线。`;
+  return planTrip(request, opts);
+}
+// ============================================================
+// 少年游 · 系统提示词
+// ============================================================
+
+export const PLANNER_SYSTEM_PROMPT = `你是「少年游」的资深行程规划师，擅长设计"不走回头路、节奏合理、吃得地道"的旅行路线。
+
+工作规则（严格遵守）：
+1. 先调用 geocode 获取坐标和 adcode，再调用 get_weather 了解天气。
+2. 每个地点必须通过 search_pois 搜索获得，严禁编造地点名称/地址/坐标。
+3. 对计划采用的餐厅/酒店，应调用 get_poi_detail 获取真实评分、人均、营业时间、照片。
+4. 相邻地点必须调用 calc_route 获取真实交通耗时与距离（近距离用 walking，跨区用 transit），不得估算。
+5. 同一天地点地理上集中，减少跨区往返；每天跨江/跨区移动不超过1次。
+6. 每个地点在整个行程中只能出现一次，禁止不同天重复安排同一景点或餐厅。
+7. 同一天内各时间段不重叠，前一个结束后才能开始下一个，并留出交通时间。
+8. 每天3-5个地点，含午餐和晚餐，时间09:00-21:00（用户不喜欢早起的除外）。
+9. 雨天/高温减少户外活动，优先博物馆、美术馆、咖啡馆、商场等室内场所；把户外行程调整到天气好的时段。
+10. 搜索要克制：景点最多搜5个关键词、餐厅最多搜4个、酒店最多搜3个；每个地点核实一次即可，不要重复调用 get_poi_detail。
+11. calc_route 的 origin/destination 优先传 search_pois 返回的 location 坐标（lng,lat），不要传地名。
+12. 如果工具返回 error，必须调整参数重新调用（换关键词/换城市/换交通方式），严禁在失败后编造地点或耗时。
+13. 完成工具调用后，直接输出 JSON，不要输出任何其他文字、解释或思考过程。
+
+输出格式（纯 JSON，不要 markdown 代码块，不要任何多余文字）：
+{"city":"城市名","days":[{"day":1,"date":"YYYY-MM-DD","theme":"当日主题","weather":"当日天气","items":[{"time":"HH:MM-HH:MM","name":"地点名","type":"spot|meal","address":"真实地址","location":"经度,纬度（来自POI搜索）","note":"建议游玩时长或人均","transport_to_next":"交通方式和耗时"}]}],"hotels":[{"name":"酒店名","address":"地址","location":"经度,纬度","rating":"评分","reason":"推荐理由"}],"summary":{"estimated_cost":"约XXX元/人","budget":{"hotel":"¥..","food":"¥..","transport":"¥..","tickets":"¥..","other":"¥.."},"tips":"一句话贴士","weather_alert":"天气提醒（如无则留空）"}}`;
+
+export function buildSystemPrompt(memoryText) {
+  if (!memoryText) return PLANNER_SYSTEM_PROMPT;
+  return `${PLANNER_SYSTEM_PROMPT}\n\n【用户长期偏好，务必遵守】\n${memoryText}`;
+}
+// ============================================================
+// 少年游 · 高德地图工具集 + 工具注册表
+// 每个工具统一返回：成功 → 纯数据；失败 → { error: '可操作提示' }
+// ============================================================
+
+import 'dotenv/config';
+
+const AMAP_KEY = process.env.AMAP_WEB_SERVICE_KEY;
+const BASE = 'https://restapi.amap.com';
+
+// ---------- 通用请求（超时 + 重试） ----------
+async function fetchJSON(url, { timeout = 8000, retries = 1 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      console.warn(`   ⏳ 请求失败（${err.message}），第 ${attempt + 1} 次重试...`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+// ---------- 1. 地理编码 ----------
+export async function geocode(address) {
+  try {
+    const url = `${BASE}/v3/geocode/geo?address=${encodeURIComponent(address)}&key=${AMAP_KEY}`;
+    const res = await fetchJSON(url);
+    if (res.status !== '1' || !res.geocodes?.length) return { error: `地理编码失败：${address}` };
+    const g = res.geocodes[0];
+    return { name: g.formatted_address, location: g.location, adcode: g.adcode, city: g.city?.length ? g.city : g.province };
+  } catch (err) {
+    return { error: `地理编码请求异常：${err.message}` };
+  }
+}
+
+// ---------- 2. 天气（未来4天） ----------
+export async function getWeather(adcode) {
+  try {
+    const url = `${BASE}/v3/weather/weatherInfo?city=${adcode}&key=${AMAP_KEY}&extensions=all`;
+    const res = await fetchJSON(url);
+    if (res.status !== '1') return { error: `天气查询失败（adcode: ${adcode}）` };
+    const WEEK = {1:'周一',2:'周二',3:'周三',4:'周四',5:'周五',6:'周六',7:'周日'};
+    return (res.forecasts?.[0]?.casts ?? []).map(c => ({
+      date: c.date,
+      week: WEEK[c.week] || c.week,
+      weather: c.dayweather === c.nightweather ? c.dayweather : `${c.dayweather}转${c.nightweather}`,
+      temp: `${c.nighttemp}~${c.daytemp}℃`,
+      daypower: c.daypower || '',
+    }));
+  } catch (err) {
+    return { error: `天气请求异常：${err.message}` };
+  }
+}
+
+// ---------- 3. POI 搜索 ----------
+export async function searchPois({ keywords, city, types, offset = 5 }) {
+  try {
+    const params = new URLSearchParams({ key: AMAP_KEY, keywords, city, citylimit: 'true', offset: String(offset) });
+    if (types) params.set('types', types);
+    const res = await fetchJSON(`${BASE}/v3/place/text?${params}`);
+    if (res.status !== '1') return { error: `POI 搜索失败：${keywords}` };
+    // 只保留规划/地图所需的精简字段，控制上下文大小
+    const pois = (res.pois ?? []).filter(p => p.location?.length).map(p => ({
+      id: p.id, name: p.name, type: p.type, address: p.address, location: p.location,
+    }));
+    if (!pois.length) return { error: `未搜到「${keywords}」相关地点，请更换关键词或城市重试` };
+    return pois;
+  } catch (err) {
+    return { error: `POI 请求异常：${err.message}` };
+  }
+}
+
+// ---------- 4. POI 详情（照片/评分/人均/营业时间） ----------
+export async function getPoiDetail(id) {
+  try {
+    const res = await fetchJSON(`${BASE}/v3/place/detail?key=${AMAP_KEY}&id=${encodeURIComponent(id)}`);
+    if (res.status !== '1') return { error: `POI 详情获取失败（id: ${id}）` };
+    const p = res.pois?.[0];
+    if (!p) return { error: `未找到 POI 详情（id: ${id}）` };
+    const biz = p.biz_ext || {};
+    const norm = v => (Array.isArray(v) ? (v.join('') || '') : (v || ''));
+    return {
+      id: p.id, name: p.name, type: p.type, address: p.address, location: p.location,
+      tel: p.tel || '',
+      photos: (p.photos || []).slice(0, 3).map(ph => ph.url),
+      rating: norm(biz.rating), cost_yuan: norm(biz.cost), open_time: norm(biz.open_time),
+    };
+  } catch (err) {
+    return { error: `POI 详情请求异常：${err.message}` };
+  }
+}
+
+// ---------- 5. 路线规划（公交/步行/驾车） ----------
+// 高德路线接口要求坐标；这里把地名或坐标统一解析为 "lng,lat"
+async function resolveToCoord(input, city) {
+  const s = String(input || '').trim();
+  if (/^-?\d+\.\d+,-?\d+\.\d+$/.test(s)) return s;
+  const query = city && !s.includes(city) ? `${city}${s}` : s;
+  const g = await geocode(query);
+  if (g.error || !g.location) throw new Error(g.error || `无法解析地点坐标：${s}`);
+  return g.location;
+}
+
+export async function calcRoute({ origin, destination, city, mode = 'transit' }) {
+  try {
+    const originLoc = await resolveToCoord(origin, city);
+    const destinationLoc = await resolveToCoord(destination, city);
+    let url;
+    if (mode === 'transit') {
+      url = `${BASE}/v3/direction/transit/integrated?origin=${originLoc}&destination=${destinationLoc}&city=${encodeURIComponent(city)}&cityd=${encodeURIComponent(city)}&key=${AMAP_KEY}`;
+    } else {
+      url = `${BASE}/v3/direction/${mode}?origin=${originLoc}&destination=${destinationLoc}&key=${AMAP_KEY}`;
+    }
+    const res = await fetchJSON(url);
+    if (res.status !== '1') return { error: `路径规划失败（${origin} → ${destination}）` };
+    if (mode === 'transit') {
+      const t = res.route?.transits?.[0];
+      if (!t) return { error: `无公共交通方案（${origin} → ${destination}），改用 walking 或 driving 重新计算` };
+      return { mode, duration_minutes: Math.round(Number(t.duration) / 60), distance_km: +(Number(t.distance) / 1000).toFixed(1), cost_yuan: t.cost || '0' };
+    }
+    const p = res.route?.paths?.[0];
+    if (!p) return { error: `无${mode}路线（${origin} → ${destination}）` };
+    return { mode, duration_minutes: Math.round(Number(p.duration) / 60), distance_km: +(Number(p.distance) / 1000).toFixed(1) };
+  } catch (err) {
+    return { error: `路径规划请求异常：${err.message}` };
+  }
+}
+
+// ---------- 工具注册表（给 LLM 的 function schema） ----------
+export const TOOL_SCHEMAS = [
+  { type: 'function', function: { name: 'geocode', description: '将地名/城市名转换为经纬度和城市编码（adcode）。规划前必须先调用。',
+    parameters: { type: 'object', properties: { address: { type: 'string' } }, required: ['address'] } } },
+  { type: 'function', function: { name: 'get_weather', description: '查询城市未来4天天气预报（天气、温度、风力）。',
+    parameters: { type: 'object', properties: { adcode: { type: 'string' } }, required: ['adcode'] } } },
+  { type: 'function', function: { name: 'search_pois', description: '搜索 POI（景点/餐厅/酒店/咖啡厅等）。所有地点必须来自本工具，严禁编造。types 可选：110000=风景名胜, 050000=餐饮, 100000=住宿服务, 060100=商场, 080300=博物馆, 050500=咖啡厅。',
+    parameters: { type: 'object', properties: { keywords: { type: 'string' }, city: { type: 'string' }, types: { type: 'string' }, offset: { type: 'number' } }, required: ['keywords', 'city'] } } },
+  { type: 'function', function: { name: 'get_poi_detail', description: '获取单个 POI 的真实详情（照片、评分、人均、营业时间）。计划采用的餐厅/酒店应调用本工具核实。',
+    parameters: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } } },
+  { type: 'function', function: { name: 'calc_route', description: '计算两点间路线耗时与距离。mode=transit(公交)/walking(步行)/driving(驾车)。近距离用 walking，跨区用 transit。',
+    parameters: { type: 'object', properties: { origin: { type: 'string' }, destination: { type: 'string' }, city: { type: 'string' }, mode: { type: 'string', enum: ['transit', 'walking', 'driving'] } }, required: ['origin', 'destination', 'city'] } } },
+];
+
+// ---------- 统一分发 ----------
+export async function dispatchTool(name, args) {
+  switch (name) {
+    case 'geocode': return geocode(args.address);
+    case 'get_weather': return getWeather(args.adcode);
+    case 'search_pois': return searchPois(args);
+    case 'get_poi_detail': return getPoiDetail(args.id);
+    case 'calc_route': return calcRoute(args);
+    default: return { error: `未知工具：${name}` };
+  }
+}
+// ============================================================
+// 少年游 · 行程校验 + JSON 提取（确定性代码，非 LLM）
+// ============================================================
+
+// 从 LLM 输出中提取 JSON（兼容 markdown 代码块 / 多余文字）
+export function extractJSON(text) {
+  if (!text) return null;
+  try { return JSON.parse(text.trim()); } catch {}
+  try { return JSON.parse(text.replace(/```json|```/g, '').trim()); } catch {}
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start !== -1 && end !== -1 && end > start) {
+    try { return JSON.parse(text.slice(start, end + 1)); } catch {}
+  }
+  return null;
+}
+
+// "HH:MM" → 分钟数；非法返回 null
+function toMin(t) {
+  if (!t) return null;
+  const m = t.match(/(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+// 规则校验：查重 / 时间重叠 / 缺坐标
+export function validatePlan(plan) {
+  const issues = [];
+  const seen = new Set();
+  for (const day of plan.days || []) {
+    let prevEnd = 0;
+    for (const item of day.items || []) {
+      if (seen.has(item.name)) issues.push(`地点重复：${item.name}`);
+      seen.add(item.name);
+      if (!item.location) issues.push(`缺少坐标：${item.name}`);
+      const start = toMin((item.time || '').split('-')[0]);
+      const end = toMin((item.time || '').split('-')[1]);
+      if (start != null && start < prevEnd) issues.push(`Day${day.day} 时间重叠：${item.name}（${item.time}）`);
+      if (end != null) prevEnd = Math.max(prevEnd, end);
+    }
+  }
+  return issues;
+}
+import { defineConfig } from 'vite';
+import vue from '@vitejs/plugin-vue';
+
+export default defineConfig({
+  plugins: [vue()],
+  server: {
+    port: 5173,
+    proxy: {
+      // 前端请求 /api/* 转发到后端
+      '/api': 'http://localhost:3000',
+    },
+  },
+});
+// 调用后端 SSE 接口，流式解析进度事件
+export async function streamPlan(request, onEvent) {
+  const res = await fetch('/api/plan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request }),
+  });
+  if (!res.ok || !res.body) throw new Error(`请求失败（${res.status}）`);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n\n')) !== -1) {
+      const raw = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 2);
+      if (raw.startsWith('data: ')) {
+        try { onEvent(JSON.parse(raw.slice(6))); } catch {}
+      }
+    }
+  }
+}
+
+export async function replan(plan, message, onEvent) {
+  const res = await fetch('/api/replan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ plan, message }),
+  });
+  if (!res.ok || !res.body) throw new Error(`请求失败（${res.status}）`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n\n')) !== -1) {
+      const raw = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 2);
+      if (raw.startsWith('data: ')) {
+        try { onEvent(JSON.parse(raw.slice(6))); } catch {}
+      }
+    }
+  }
+}
+import { createApp } from 'vue';
+import Vant from 'vant';
+import 'vant/lib/index.css';
+import App from './App.vue';
+import './style.css';
+
+createApp(App).use(Vant).mount('#app');
+// 动态加载高德地图 JS API 2.0（含安全密钥）
+let amapPromise = null;
+
+export function loadAMap() {
+  if (window.AMap) return Promise.resolve(window.AMap);
+  if (amapPromise) return amapPromise;
+
+  amapPromise = new Promise((resolve, reject) => {
+    window._AMapSecurityConfig = {
+      securityJsCode: import.meta.env.VITE_AMAP_SECURITY_CODE,
+    };
+    const script = document.createElement('script');
+    script.src = `https://webapi.amap.com/maps?v=2.0&key=${import.meta.env.VITE_AMAP_JS_KEY}`;
+    script.onload = () => resolve(window.AMap);
+    script.onerror = () => reject(new Error('高德地图加载失败，请检查 JS API Key 与域名白名单'));
+    document.head.appendChild(script);
+  });
+  return amapPromise;
+}
+<script setup>
+import { ref, computed } from 'vue';
+import Home from './views/Home.vue';
+import Form from './views/Form.vue';
+import Progress from './views/Progress.vue';
+import Itinerary from './views/Itinerary.vue';
+import MapPage from './views/MapPage.vue';
+import Mine from './views/Mine.vue';
+
+const view = ref('home');
+const request = ref('');
+const plan = ref(null);
+const activeTab = ref('home');
+
+// 规划完成后，才在 首页/行程/地图/我的 之间显示底部导航
+const showNav = computed(() => plan.value != null && ['home', 'itinerary', 'map', 'mine'].includes(view.value));
+
+function onExplore() { view.value = 'form'; }
+function onSubmit(req) { request.value = req; view.value = 'progress'; }
+function onDone(p) { plan.value = p; activeTab.value = 'itinerary'; view.value = 'itinerary'; }
+function onTabChange(name) { activeTab.value = name; view.value = name; }
+</script>
+
+<template>
+  <transition name="fade" mode="out-in">
+    <Home v-if="view === 'home'" key="home" @explore="onExplore" />
+    <Form v-else-if="view === 'form'" key="form" @submit="onSubmit" @back="view = 'home'" />
+    <Progress v-else-if="view === 'progress'" key="progress" :request="request" @done="onDone" @back="view = 'form'" />
+    <Itinerary v-else-if="view === 'itinerary'" key="itinerary" :plan="plan" @restart="onTabChange('home')" @update="plan = $event" />
+    <MapPage v-else-if="view === 'map'" key="map" :plan="plan" />
+    <Mine v-else key="mine" />
+  </transition>
+
+  <van-tabbar
+    v-if="showNav"
+    v-model="activeTab"
+    active-color="#6B7F5E"
+    inactive-color="#9B9B9B"
+    fixed
+    safe-area-inset-bottom
+    @change="onTabChange"
+  >
+    <van-tabbar-item name="home" icon="home-o">首页</van-tabbar-item>
+    <van-tabbar-item name="itinerary" icon="orders-o">行程</van-tabbar-item>
+    <van-tabbar-item name="map" icon="location-o">地图</van-tabbar-item>
+    <van-tabbar-item name="mine" icon="user-o">我的</van-tabbar-item>
+  </van-tabbar>
+</template>
+<script setup>
+import { ref } from 'vue';
+
+const emit = defineEmits(['submit', 'back']);
+
+const dest = ref('');
+const start = ref('');
+const end = ref('');
+const people = ref(2);
+const relation = ref('朋友');
+const budget = ref('¥2000-5000');
+const prefs = ref([]);
+const nl = ref('');
+
+const RELATIONS = [
+  { value: '独自旅行', icon: '👤', label: '一个人' },
+  { value: '情侣', icon: '👫', label: '情侣' },
+  { value: '朋友', icon: '👯', label: '朋友' },
+  { value: '家人', icon: '👨‍👩‍👧', label: '家人' },
+];
+
+const BUDGETS = ['¥1000以内', '¥1000-2000', '¥2000-5000', '¥5000以上'];
+
+const PREF_ITEMS = [
+  { value: '美食', icon: '🍜', label: '吃很多好吃的' },
+  { value: '自然风景', icon: '🌿', label: '看自然风景' },
+  { value: '人文历史', icon: '🏛️', label: '感受当地文化' },
+  { value: '拍照打卡', icon: '📷', label: '拍很多照片' },
+  { value: '咖啡', icon: '☕', label: '找咖啡馆发呆' },
+  { value: '夜生活', icon: '🌙', label: '夜晚也精彩' },
+  { value: '购物', icon: '🛍️', label: '逛逛买买' },
+  { value: '博物馆', icon: '🏛️', label: '逛博物馆' },
+  { value: '小众景点', icon: '📍', label: '去小众地方' },
+  { value: '松弛休闲', icon: '🛋️', label: '慢慢放松' },
+  { value: '特种兵', icon: '🏃', label: '一次玩够' },
+];
+
+function togglePref(p) {
+  const i = prefs.value.indexOf(p);
+  if (i >= 0) prefs.value.splice(i, 1);
+  else prefs.value.push(p);
+}
+
+function days() {
+  if (!start.value || !end.value) return 0;
+  return Math.round((new Date(end.value) - new Date(start.value)) / 86400000) + 1;
+}
+
+function submit() {
+  if (!dest.value) return alert('请先输入目的地');
+  const d = days() || 3;
+  const req = [
+    `帮我规划一个${dest.value}${d}日游。`,
+    `日期：${start.value || '待定'} 至 ${end.value || '待定'}`,
+    `人数：${people.value}人，${relation.value}`,
+    `预算：${budget.value}`,
+    `偏好：${prefs.value.join('、') || '无特别偏好'}`,
+    `额外需求：${nl.value || '无'}`,
+  ].join('\n');
+  emit('submit', req);
+}
+</script>
+
+<template>
+  <div class="page">
+    <div class="topbar">
+      <van-icon name="arrow-left" size="20" @click="emit('back')" />
+      <span class="topbar-title play">规划这一程</span>
+    </div>
+
+    <!-- 目的地 -->
+    <div class="q hand">这一次，你想去哪里？</div>
+    <div class="card">
+      <van-field v-model="dest" placeholder="例如：杭州 / 成都 / 西安" label-width="0" />
+    </div>
+
+    <!-- 日期 -->
+    <div class="q hand">准备玩几天？</div>
+    <div class="card row">
+      <input type="date" v-model="start" class="date-input" />
+      <span class="muted">至</span>
+      <input type="date" v-model="end" class="date-input" />
+      <span class="days play" v-if="days()">{{ days() }} 天</span>
+    </div>
+
+    <!-- 人数 -->
+    <div class="q hand">几个人去？</div>
+    <div class="card row">
+      <van-stepper v-model="people" min="1" max="10" theme="round" button-size="26" />
+      <span class="muted" style="margin-left:10px">{{ people }} 人</span>
+    </div>
+
+    <!-- 关系 -->
+    <div class="q hand">和谁一起？</div>
+    <div class="rel-grid">
+      <div
+        v-for="r in RELATIONS" :key="r.value"
+        class="rel-card" :class="{ active: relation === r.value }"
+        @click="relation = r.value"
+      >
+        <span class="rel-icon">{{ r.icon }}</span>
+        <span class="rel-label play">{{ r.label }}</span>
+      </div>
+    </div>
+
+    <!-- 预算 -->
+    <div class="q hand">预算大概多少？</div>
+    <div class="card">
+      <span
+        v-for="b in BUDGETS" :key="b"
+        class="chip" :class="{ active: budget === b }"
+        @click="budget = b"
+      >{{ b }}</span>
+    </div>
+
+    <!-- 偏好 -->
+    <div class="q hand">这次最想要什么？</div>
+    <div class="card">
+      <span
+        v-for="p in PREF_ITEMS" :key="p.value"
+        class="chip pref-chip" :class="{ active: prefs.includes(p.value) }"
+        @click="togglePref(p.value)"
+      >{{ p.icon }} {{ p.label }}</span>
+    </div>
+
+    <!-- 自然语言 -->
+    <div class="q hand">还有什么想说？</div>
+    <div class="card note-card">
+      <van-field
+        v-model="nl"
+        type="textarea" rows="2" autosize
+        placeholder="例如：不想早起，喜欢拍照和吃，不想去人特别多的地方"
+      />
+    </div>
+
+    <button class="btn-main" style="margin-top: 28px" @click="submit">开始规划 ✨</button>
+  </div>
+</template>
+
+<style scoped>
+.topbar { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.topbar-title { font-size: 18px; letter-spacing: 2px; }
+.q { font-size: 22px; color: var(--ink); margin: 26px 0 12px; letter-spacing: 1px; }
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.date-input {
+  border: 1.5px solid var(--line); border-radius: 10px;
+  padding: 8px 10px; font-size: 14px; background: #fff; color: var(--ink);
+}
+.days { margin-left: auto; color: var(--olive); font-size: 16px; }
+
+.rel-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.rel-card {
+  background: #fff; border-radius: 14px; padding: 16px 6px;
+  text-align: center; box-shadow: var(--shadow);
+  border: 2px solid transparent; transition: all .15s;
+}
+.rel-icon { font-size: 30px; display: block; margin-bottom: 6px; }
+.rel-label { font-size: 13px; color: #777; }
+.rel-card.active { border-color: var(--sage); background: #F2F6EF; }
+.rel-card.active .rel-label { color: var(--olive); }
+
+.pref-chip { padding: 10px 14px; font-size: 14px; }
+.note-card { background: linear-gradient(180deg, #FFFDF4, #FFFFFF); border: 1px dashed var(--line); }
+</style>
+<script setup>
+const emit = defineEmits(['explore']);
+</script>
+
+<template>
+  <div class="home">
+    <!-- 倾斜的胶片贴纸浮层 -->
+    <div class="stickers">
+      <span class="sticker s1">✈️</span>
+      <span class="sticker s2">🏔️</span>
+      <span class="sticker s3">📷</span>
+      <span class="sticker s4">🧳</span>
+    </div>
+
+    <div class="hero">
+      <p class="kicker play">现在就出发</p>
+      <h1 class="poem hand">欲买桂花同载酒</h1>
+      <h1 class="poem hand">终不似，少年游</h1>
+      <p class="sub play">这一程，去看看吧。</p>
+    </div>
+
+    <div class="hero-actions">
+      <button class="btn-sticker" @click="emit('explore')">开始探索 →</button>
+      <p class="hint muted">AI 帮你把一场旅行真正规划出来</p>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.home {
+  min-height: 100vh;
+  max-width: 430px; margin: 0 auto;
+  position: relative;
+  display: flex; flex-direction: column; justify-content: center;
+  padding: 40px 28px;
+  overflow: hidden;
+  background:
+    radial-gradient(90% 50% at 15% 12%, rgba(242,215,124,0.30), transparent 60%),
+    radial-gradient(80% 45% at 90% 20%, rgba(168,203,224,0.32), transparent 60%),
+    radial-gradient(70% 40% at 50% 90%, rgba(143,169,143,0.22), transparent 60%),
+    var(--bg);
+}
+.stickers { position: absolute; inset: 0; pointer-events: none; }
+.sticker {
+  position: absolute; font-size: 34px;
+  filter: drop-shadow(0 4px 8px rgba(0,0,0,0.10));
+  opacity: .9;
+}
+.s1 { top: 12%; left: 12%; transform: rotate(-12deg); }
+.s2 { top: 22%; right: 14%; transform: rotate(10deg); }
+.s3 { bottom: 26%; left: 10%; transform: rotate(8deg); }
+.s4 { bottom: 14%; right: 12%; transform: rotate(-10deg); }
+
+.hero { text-align: center; position: relative; z-index: 1; }
+.kicker {
+  display: inline-block; font-size: 15px; letter-spacing: 6px;
+  color: var(--olive); margin-bottom: 34px;
+  padding: 5px 18px; border: 1px dashed var(--sage); border-radius: 999px;
+}
+.poem {
+  font-weight: 400; font-size: 34px; line-height: 1.55;
+  color: var(--ink); letter-spacing: 4px;
+}
+.sub { margin-top: 22px; color: #7a7a7a; letter-spacing: 5px; font-size: 15px; }
+
+.hero-actions { text-align: center; margin-top: 54px; position: relative; z-index: 1; }
+.hint { margin-top: 22px; letter-spacing: 1px; }
+</style>
+<script setup>
+import { ref, computed } from 'vue';
+import MapView from './MapView.vue';
+import { replan } from '../api.js';
+
+const props = defineProps({ plan: Object });
+const emit = defineEmits(['restart', 'update']);
+
+const activeDay = ref(0);
+const focusIndex = ref(null);
+const replanMsg = ref('');
+const replanning = ref(false);
+const showAsk = ref(false);
+const showAdd = ref(false);
+const addName = ref('');
+const addNote = ref('');
+
+const totalDays = computed(() => props.plan?.days?.length || 0);
+
+// 当前天 + 酒店 的地图标记
+const markers = computed(() => {
+  const list = [];
+  (props.plan?.hotels || []).forEach(h => { if (h.location) list.push({ name: h.name, location: h.location, type: 'hotel' }); });
+  const day = props.plan?.days?.[activeDay.value];
+  (day?.items || []).forEach(it => { if (it.location) list.push({ name: it.name, location: it.location, type: it.type }); });
+  return list;
+});
+
+// 顶部天气卡片（取第 1 天）
+const day0Weather = computed(() => props.plan?.days?.[0]?.weather || '');
+const weatherAlert = computed(() => props.plan?.summary?.weather_alert || '');
+
+const DAY_EMOJI = ['🌿', '🍵', '🌅', '⛰️', '🌊', '☕', '📷'];
+
+function weatherEmoji(w) {
+  if (/雨|雪|雷/.test(w)) return '☔';
+  if (/阴/.test(w)) return '☁️';
+  if (/晴/.test(w)) return '☀️';
+  return '🌤️';
+}
+function weatherSentence(w) {
+  if (/雨|雪|雷/.test(w)) return '今天可能下雨，记得带伞，室内逛逛也不错';
+  if (/阴/.test(w)) return '天气有点阴，适合慢慢走走';
+  if (/晴|多云/.test(w)) return '今天很适合出门走走';
+  return '天气不错，放心出发吧';
+}
+
+// 点击行程项 → 地图定位（markers 前面有酒店占位）
+function clickItem(idx) {
+  focusIndex.value = (props.plan?.hotels || []).length + idx;
+}
+
+// 通用：让 AI 基于现有行程 + 一段话重新规划
+async function runReplan(message) {
+  if (!message || replanning.value) return;
+  replanning.value = true;
+  try {
+    let newPlan = null;
+    await replan(props.plan, message, (e) => {
+      if (e.type === 'done') newPlan = e.plan;
+    });
+    if (newPlan) {
+      emit('update', newPlan);
+      focusIndex.value = null;
+    }
+  } catch (e) {
+    alert('重新规划失败：' + e.message);
+  } finally {
+    replanning.value = false;
+  }
+}
+
+// 「问问小游」发送
+function sendAsk() {
+  const msg = replanMsg.value.trim();
+  if (!msg) return;
+  runReplan(msg);
+  replanMsg.value = '';
+  showAsk.value = false;
+}
+
+// 天气提醒 → 一键调整
+function adjustForWeather() {
+  if (!weatherAlert.value) return;
+  runReplan(`根据天气提醒调整行程：${weatherAlert.value}`);
+}
+
+// 手动添加地点
+function openAdd(dayIndex) {
+  addName.value = '';
+  addNote.value = '';
+  showAdd.value = true;
+}
+
+function confirmAdd() {
+  const name = addName.value.trim();
+  if (!name) return;
+  const day = props.plan?.days?.[activeDay.value];
+  const dayLabel = day?.day || (activeDay.value + 1);
+  const note = addNote.value.trim();
+  runReplan(`请在第 ${dayLabel} 天的行程中手动加入一个地点「${name}」${note ? `（备注：${note}）` : ''}。请合理安排它当天的时间，并重新计算它与前后地点之间的交通路线，保证当天节奏合理。`);
+  showAdd.value = false;
+}
+</script>
+
+<template>
+  <div class="page" v-if="plan">
+    <!-- 顶部总览 -->
+    <div class="overview">
+      <div class="ov-city hand">{{ plan.city }} · {{ totalDays }}天{{ totalDays - 1 }}晚</div>
+      <div class="ov-meta">
+        <span>🗓 {{ plan.days?.[0]?.date || '—' }}</span>
+        <span>💰 {{ plan.summary?.estimated_cost || '—' }}</span>
+      </div>
+    </div>
+
+    <!-- 天气卡片 -->
+    <div class="weather-card">
+      <span class="w-icon">{{ weatherEmoji(day0Weather) }}</span>
+      <div class="w-body">
+        <div class="w-temp play">{{ day0Weather }}</div>
+        <div class="hand-note">{{ weatherSentence(day0Weather) }}</div>
+      </div>
+    </div>
+
+    <!-- 天气提醒（AI 价值） -->
+    <div v-if="weatherAlert" class="alert-card">
+      <div class="alert-head">☔ 天气提醒</div>
+      <div class="alert-body">{{ weatherAlert }}</div>
+      <button class="alert-btn play" @click="adjustForWeather">帮我调整 →</button>
+    </div>
+
+    <!-- 地图（与行程联动） -->
+    <div class="map-section">
+      <div class="map-hint hand-note">👆 点下面的行程，地图会带你去</div>
+      <MapView :markers="markers" :focus-index="focusIndex" />
+    </div>
+
+    <!-- 每日行程 -->
+    <van-tabs v-model:active="activeDay" sticky color="#6B7F5E" title-active-color="#6B7F5E">
+      <van-tab v-for="(day, i) in plan.days" :key="i" :title="'DAY ' + day.day">
+        <div class="day-head">
+          <div class="day-theme hand">{{ DAY_EMOJI[i % DAY_EMOJI.length] }} {{ day.theme }}</div>
+          <div class="muted">{{ day.weather }}</div>
+        </div>
+        <div class="timeline">
+          <div v-for="(it, j) in day.items" :key="j" class="tl-item anim-item" :style="{ animationDelay: (j * 0.05) + 's' }" @click="clickItem(j)">
+            <div class="tl-time play">{{ it.time?.split('-')[0] }}</div>
+            <div class="tl-dot" :class="{ meal: it.type === 'meal' }"></div>
+            <div class="tl-card" :class="{ meal: it.type === 'meal' }">
+              <div class="tl-name">{{ it.type === 'meal' ? '🍜' : '📍' }} {{ it.name }}</div>
+              <div v-if="it.address" class="muted">{{ it.address }}</div>
+              <div v-if="it.note" class="hand-note">{{ it.note }}</div>
+              <div v-if="it.transport_to_next" class="tl-transport">↓ {{ it.transport_to_next }}</div>
+            </div>
+          </div>
+        </div>
+        <div class="add-btn play" @click="openAdd(i)">＋ 手动添加一个地点</div>
+      </van-tab>
+    </van-tabs>
+
+    <!-- 酒店推荐 -->
+    <div class="section-title">🏨 今晚住这里</div>
+    <div class="card hotel-card" v-for="(h, i) in (plan.hotels || [])" :key="i">
+      <div class="hotel-name play">{{ h.name }}</div>
+      <div class="muted" style="margin:4px 0">{{ h.address }}</div>
+      <div v-if="h.rating" class="hotel-rating">⭐ {{ h.rating }}</div>
+      <div v-if="h.reason" class="hand-note hotel-reason">「{{ h.reason }}」</div>
+    </div>
+
+    <!-- 预算 -->
+    <div class="section-title">💰 这一程的预算</div>
+    <div class="card">
+      <div class="budget-grid">
+        <div v-for="(v, k) in plan.summary?.budget || {}" :key="k" class="budget-item">
+          <span class="muted">{{ { hotel: '🏨 酒店', food: '🍜 餐饮', transport: '🚕 交通', tickets: '🎫 门票', other: '🧾 其他' }[k] || k }}</span>
+          <span class="play">{{ v }}</span>
+        </div>
+      </div>
+      <div class="muted" style="margin-top: 12px">💡 {{ plan.summary?.tips }}</div>
+    </div>
+
+    <button class="btn-main" style="margin-top: 8px" @click="emit('restart')">重新规划一程</button>
+
+    <!-- 悬浮 AI 助手 -->
+    <button class="ask-fab play" @click="showAsk = true">✨ 问问小游</button>
+
+    <!-- 重新规划中的提示 -->
+    <div v-if="replanning" class="replan-banner play">✨ 小游正在调整这一程…</div>
+
+    <!-- AI 对话面板 -->
+    <van-popup v-model:show="showAsk" position="bottom" round>
+      <div class="ask-panel">
+        <div class="ask-title hand">问问小游 ✨</div>
+        <p class="muted" style="margin-bottom:10px">旅行中遇到问题？告诉我，小游帮你重新安排</p>
+        <van-field
+          v-model="replanMsg" type="textarea" rows="2" autosize
+          placeholder="比如：今天下雨了怎么办？附近有什么好吃的？"
+        />
+        <button class="btn-main" style="margin-top:14px" :disabled="replanning" @click="sendAsk">
+          {{ replanning ? '正在重新规划…' : '发送' }}
+        </button>
+      </div>
+    </van-popup>
+
+    <!-- 手动添加地点面板 -->
+    <van-popup v-model:show="showAdd" position="bottom" round>
+      <div class="ask-panel">
+        <div class="ask-title hand">手动添加地点</div>
+        <p class="muted" style="margin-bottom:10px">添加到 第 {{ plan.days?.[activeDay]?.day }} 天 · 小游会自动调整时间和路线</p>
+        <van-field v-model="addName" placeholder="地点名称，例如：雷峰塔" />
+        <van-field v-model="addNote" placeholder="备注（可选），例如：想看日落" style="margin-top:8px" />
+        <button class="btn-main" style="margin-top:14px" :disabled="replanning" @click="confirmAdd">
+          {{ replanning ? '正在调整…' : '添加并让 AI 调整' }}
+        </button>
+      </div>
+    </van-popup>
+  </div>
+</template>
+
+<style scoped>
+.overview { padding: 4px 0 6px; }
+.ov-city { font-size: 30px; letter-spacing: 2px; }
+.ov-meta { display: flex; gap: 16px; margin: 10px 0 14px; color: #777; font-size: 14px; }
+
+.weather-card {
+  display: flex; align-items: center; gap: 14px;
+  background: linear-gradient(120deg, #EAF2EC, #F4F8F4);
+  border-radius: 16px; padding: 16px; margin-bottom: 12px;
+}
+.w-icon { font-size: 34px; }
+.w-temp { font-size: 18px; color: var(--olive); margin-bottom: 4px; }
+
+.alert-card {
+  background: #FDF0ED; border: 1px solid #F3D2CC;
+  border-radius: 16px; padding: 14px 16px; margin-bottom: 12px;
+}
+.alert-head { font-family: var(--font-play); color: var(--coral); font-size: 15px; margin-bottom: 6px; }
+.alert-body { font-size: 13px; color: #8a5a52; line-height: 1.6; }
+.alert-btn {
+  margin-top: 10px; background: var(--coral); color: #fff; border: none;
+  border-radius: 999px; padding: 8px 16px; font-size: 13px;
+}
+
+.map-section { margin-bottom: 14px; }
+.map-hint { margin-bottom: 8px; }
+
+.day-head { display: flex; align-items: baseline; justify-content: space-between; padding: 16px 2px 10px; }
+.day-theme { font-size: 22px; letter-spacing: 1px; }
+
+.timeline { position: relative; padding-left: 52px; }
+.tl-item { position: relative; padding-bottom: 14px; cursor: pointer; }
+.tl-time { position: absolute; left: -52px; top: 0; font-size: 14px; color: var(--olive); }
+.tl-dot {
+  position: absolute; left: -11px; top: 6px;
+  width: 11px; height: 11px; border-radius: 50%;
+  background: var(--sage); border: 2px solid #fff; box-shadow: 0 0 0 1px var(--sage);
+}
+.tl-dot.meal { background: var(--yellow); box-shadow: 0 0 0 1px var(--yellow); }
+.tl-item:not(:last-child)::before {
+  content: ''; position: absolute; left: -7px; top: 22px; bottom: -6px;
+  border-left: 2px dashed var(--sage); opacity: .5;
+}
+.tl-card {
+  background: #fff; border-radius: 14px; padding: 12px 14px; box-shadow: var(--shadow);
+}
+.tl-card.meal { background: #FFFDF4; }
+.tl-name { font-weight: 600; margin-bottom: 3px; }
+.tl-transport { font-size: 12px; color: var(--olive); margin-top: 6px; }
+
+.add-btn {
+  margin: 4px 0 16px 52px; padding: 12px;
+  text-align: center; color: var(--olive);
+  border: 2px dashed var(--sage); border-radius: 14px;
+  font-size: 14px; letter-spacing: 1px;
+}
+
+.hotel-card { position: relative; }
+.hotel-name { font-size: 17px; letter-spacing: 1px; }
+.hotel-rating { color: var(--orange); font-size: 13px; margin-bottom: 6px; }
+.hotel-reason { color: var(--olive); }
+
+.budget-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px 10px; }
+.budget-item { display: flex; flex-direction: column; gap: 4px; }
+.budget-item .play { font-size: 16px; color: var(--olive); }
+
+.ask-fab {
+  position: fixed; bottom: 82px; right: max(16px, calc(50vw - 199px));
+  z-index: 10; background: var(--olive); color: #fff; border: none;
+  border-radius: 999px; padding: 12px 18px; font-size: 15px;
+  box-shadow: 0 6px 18px rgba(107,127,94,0.4);
+  letter-spacing: 1px;
+}
+.replan-banner {
+  position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+  z-index: 20; background: var(--olive); color: #fff;
+  padding: 10px 22px; border-radius: 999px; font-size: 14px;
+  box-shadow: 0 6px 18px rgba(107,127,94,0.4);
+  animation: bounce 1.4s ease-in-out infinite;
+}
+.ask-panel { padding: 22px 18px 28px; }
+.ask-title { font-size: 24px; margin-bottom: 4px; }
+</style>
+<script setup>
+import { computed } from 'vue';
+import MapView from './MapView.vue';
+
+const props = defineProps({ plan: Object });
+
+// 全部地点（酒店 + 所有天的行程）
+const markers = computed(() => {
+  const list = [];
+  (props.plan?.hotels || []).forEach(h => { if (h.location) list.push({ name: h.name, location: h.location, type: 'hotel' }); });
+  (props.plan?.days || []).forEach(d => {
+    (d.items || []).forEach(it => { if (it.location) list.push({ name: it.name, location: it.location, type: it.type }); });
+  });
+  return list;
+});
+</script>
+
+<template>
+  <div class="mappage">
+    <div class="mappage-head">
+      <div class="title hand">{{ plan?.city || '这一程' }} · 路线</div>
+      <div class="muted">{{ markers.length }} 个地点</div>
+    </div>
+    <div class="map-box">
+      <MapView v-if="plan" :markers="markers" height="calc(100vh - 150px)" />
+      <div v-else class="empty muted">先去规划一程，这里就有路线啦</div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.mappage { padding: 20px 14px 80px; max-width: 430px; margin: 0 auto; }
+.mappage-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+.title { font-size: 25px; letter-spacing: 1px; }
+.map-box { border-radius: 16px; overflow: hidden; box-shadow: var(--shadow); }
+.empty { padding: 60px 20px; text-align: center; background: #fff; border-radius: 16px; }
+</style>
+<script setup>
+import { ref, watch, onMounted, onBeforeUnmount } from 'vue';
+import { loadAMap } from '../map.js';
+
+const props = defineProps({
+  markers: { type: Array, default: () => [] },  // [{ name, location:"lng,lat", type }]
+  focusIndex: { type: Number, default: null },
+  height: { type: String, default: '40vh' },
+});
+
+const container = ref(null);
+const loadError = ref('');
+let AMap = null;
+let map = null;
+let infoWindow = null;
+let amapMarkers = [];
+
+onMounted(async () => {
+  try {
+    AMap = await loadAMap();
+    map = new AMap.Map(container.value, { zoom: 12, center: [120.15, 30.28] });
+    infoWindow = new AMap.InfoWindow({ offset: new AMap.Pixel(0, -30) });
+    renderMarkers();
+  } catch (e) {
+    loadError.value = e.message;
+  }
+});
+
+onBeforeUnmount(() => { if (map) map.destroy(); });
+
+watch(() => props.markers, () => renderMarkers(), { deep: true });
+
+watch(() => props.focusIndex, (i) => {
+  if (i == null || !map || !props.markers?.[i]) return;
+  const m = props.markers[i];
+  const pos = m.location.split(',').map(Number);
+  map.setZoomAndCenter(15, pos);
+  infoWindow.setContent(`<b>${m.name}</b>`);
+  infoWindow.open(map, pos);
+});
+
+function renderMarkers() {
+  if (!map || !AMap) return;
+  amapMarkers.forEach(m => map.remove(m));
+  amapMarkers = (props.markers || []).map(m => {
+    const pos = m.location.split(',').map(Number);
+    const marker = new AMap.Marker({ position: pos, title: m.name });
+    marker.on('click', () => {
+      infoWindow.setContent(`<b>${m.name}</b>`);
+      infoWindow.open(map, pos);
+    });
+    marker.setMap(map);
+    return marker;
+  });
+  if (amapMarkers.length) map.setFitView(amapMarkers);
+}
+</script>
+
+<template>
+  <div class="map-wrap">
+    <div v-if="loadError" class="map-error">⚠️ {{ loadError }}</div>
+    <div ref="container" class="map-container" :style="{ height }"></div>
+  </div>
+</template>
+
+<style scoped>
+.map-wrap { position: relative; }
+.map-container { width: 100%; border-radius: 14px; overflow: hidden; }
+.map-error {
+  position: absolute; inset: 0; z-index: 2;
+  display: flex; align-items: center; justify-content: center;
+  background: #FDF0ED; color: #8a5a52; font-size: 13px; text-align: center; padding: 20px;
+  border-radius: 14px;
+}
+</style>
+<script setup>
+import { ref, onMounted } from 'vue';
+
+const memory = ref(null);
+const loading = ref(true);
+
+onMounted(async () => {
+  try {
+    const r = await fetch('/api/memory');
+    memory.value = await r.json();
+  } catch {}
+  finally { loading.value = false; }
+});
+</script>
+
+<template>
+  <div class="page">
+    <div class="mine-title hand">我的旅行手账</div>
+    <p class="muted" style="margin-bottom:20px">小游会慢慢记住你的喜好</p>
+
+    <div class="card">
+      <div class="section-title">❤️ 喜欢</div>
+      <div v-if="memory?.preferences?.length">
+        <span v-for="p in memory.preferences" :key="p" class="chip active">{{ p }}</span>
+      </div>
+      <span v-else class="muted">还没有记录，规划一程后就有了</span>
+    </div>
+
+    <div class="card">
+      <div class="section-title">🎈 旅行风格</div>
+      <div class="hand-note">{{ memory?.travelStyle || '还没填写' }}</div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">💳 预算习惯</div>
+      <div class="hand-note">{{ memory?.budgetHabit || '还没填写' }}</div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">🙅 不太喜欢</div>
+      <div v-if="memory?.dislikes?.length">
+        <span v-for="d in memory.dislikes" :key="d" class="chip">{{ d }}</span>
+      </div>
+      <span v-else class="muted">还没有记录</span>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.mine-title { font-size: 30px; letter-spacing: 2px; margin-bottom: 4px; }
+</style>
+<script setup>
+import { ref, computed, onMounted } from 'vue';
+import { streamPlan } from '../api.js';
+
+const props = defineProps({ request: String });
+const emit = defineEmits(['done', 'back']);
+
+// 固定的 7 个阶段（去重：每个阶段只显示一次，不随工具调用次数重复）
+const STAGES = [
+  { key: 'geocode', label: '📍 定位这座城' },
+  { key: 'get_weather', label: '☀️ 看看未来几天天气' },
+  { key: 'search_pois', label: '🗺️ 找找值得去的地方' },
+  { key: 'get_poi_detail', label: '📷 核实好吃好玩的' },
+  { key: 'calc_route', label: '🚶 研究它们之间的距离' },
+  { key: 'route_plan', label: '📆 安排每天的路线' },
+  { key: 'budget', label: '💰 帮你算算预算' },
+];
+
+const completed = ref([]);   // 已完成阶段 key（去重）
+const active = ref(null);    // 当前进行中的阶段
+const done = ref(false);
+const error = ref('');
+
+const percent = computed(() => {
+  if (done.value) return 100;
+  return Math.round(completed.value.length / STAGES.length * 100);
+});
+
+function statusOf(key) {
+  if (done.value) return 'done';
+  if (active.value === key) return 'active';
+  if (completed.value.includes(key)) return 'done';
+  return 'pending';
+}
+
+onMounted(async () => {
+  try {
+    await streamPlan(props.request, (e) => {
+      if (e.type === 'tool') {
+        if (!completed.value.includes(e.name)) completed.value.push(e.name);
+        active.value = e.name;
+      } else if (e.type === 'done') {
+        done.value = true;
+        completed.value = STAGES.map(s => s.key);
+        active.value = null;
+        setTimeout(() => emit('done', e.plan), 1300);
+      } else if (e.type === 'error') {
+        error.value = e.message;
+      }
+    });
+  } catch (err) {
+    error.value = err.message;
+  }
+});
+</script>
+
+<template>
+  <div class="page">
+    <div class="progress-head">
+      <div class="luggage" :class="{ moving: !done && !error }">🧳</div>
+      <h2 class="ptitle hand">{{ done ? '准备好了，出发吧' : error ? '哎呀，出了点小状况' : '正在替你规划这一程……' }}</h2>
+      <p class="muted">{{ error || '小游正在查天气、找好玩的、算路线' }}</p>
+    </div>
+
+    <!-- 进度条 -->
+    <div class="bar-wrap">
+      <div class="bar-track">
+        <div class="bar-fill" :style="{ width: percent + '%' }"></div>
+      </div>
+      <span class="bar-pct play">{{ percent }}%</span>
+    </div>
+
+    <!-- 阶段列表（去重） -->
+    <div class="steps">
+      <div v-for="s in STAGES" :key="s.key" class="step" :class="statusOf(s.key)">
+        <van-loading v-if="statusOf(s.key) === 'active'" size="16" color="#6B7F5E" />
+        <van-icon v-else :name="statusOf(s.key) === 'done' ? 'checked' : 'clock-o'" :color="statusOf(s.key) === 'done' ? '#6B7F5E' : '#c9c2b4'" />
+        <span>{{ s.label }}</span>
+      </div>
+    </div>
+
+    <button v-if="error" class="btn-main" style="margin-top: 28px" @click="emit('back')">返回重试</button>
+  </div>
+</template>
+
+<style scoped>
+.progress-head { text-align: center; padding: 44px 0 22px; }
+.luggage { font-size: 52px; display: inline-block; }
+.luggage.moving { animation: bounce 1.6s ease-in-out infinite; }
+.ptitle { font-size: 26px; margin: 18px 0 10px; font-weight: 400; letter-spacing: 2px; }
+
+.bar-wrap { display: flex; align-items: center; gap: 12px; margin: 6px 0 22px; }
+.bar-track { flex: 1; height: 10px; background: #EDE7DA; border-radius: 999px; overflow: hidden; }
+.bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--sage), var(--olive));
+  border-radius: 999px;
+  transition: width .5s ease;
+}
+.bar-pct { font-size: 15px; color: var(--olive); min-width: 44px; text-align: right; }
+
+.steps { margin-top: 4px; }
+.step {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px; background: #fff; border-radius: 14px;
+  margin-bottom: 10px; font-size: 15px;
+  box-shadow: var(--shadow);
+  transition: all .3s;
+}
+.step.pending { color: #c4bfb2; }
+.step.active { color: var(--ink); border: 1.5px solid var(--sage); background: #F2F6EF; }
+.step.done { color: var(--ink); }
+</style>

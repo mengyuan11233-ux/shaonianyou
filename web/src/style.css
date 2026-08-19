@@ -1,0 +1,118 @@
+:root {
+  /* —— 色彩（低饱和、明亮、自然）—— */
+  --bg: #FBF8F1;          /* 奶油白背景 */
+  --paper: #FFFFFF;
+  --ink: #3A3A3A;         /* 暖黑，不用纯黑 */
+  --muted: #9B9B9B;
+  --sage: #8FA98F;        /* 鼠尾草绿 */
+  --olive: #6B7F5E;       /* 橄榄绿 */
+  --yellow: #F2D77C;      /* 柔和黄 */
+  --orange: #F5B27E;      /* 淡橙 */
+  --sky: #A8CBE0;         /* 天空蓝 */
+  --coral: #E5897E;       /* 珊瑚红（仅告警） */
+  --line: #EDE7DA;
+
+  /* —— 字体 —— */
+  --font-hand: 'Ma Shan Zheng', 'STKaiti', 'KaiTi', cursive;
+  --font-play: 'ZCOOL KuaiLe', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-body: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+  --shadow: 0 4px 18px rgba(107,127,94,0.08);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #app { height: 100%; }
+
+body {
+  font-family: var(--font-body);
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  font-size: 15px;
+  overflow-x: hidden;
+}
+
+/* 纸张颗粒质感（极淡，不干扰内容） */
+body::before {
+  content: '';
+  position: fixed; inset: 0;
+  background-image: radial-gradient(rgba(107,127,94,0.05) 1px, transparent 1px);
+  background-size: 22px 22px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.page {
+  max-width: 430px; margin: 0 auto;
+  min-height: 100vh;
+  padding: 24px 18px 96px;
+  position: relative; z-index: 1;
+}
+
+/* —— 字体工具类 —— */
+.hand { font-family: var(--font-hand); }
+.play { font-family: var(--font-play); }
+
+/* —— 按钮 —— */
+.btn-main {
+  font-family: var(--font-play);
+  background: var(--olive); color: #fff; border: none;
+  border-radius: 999px; padding: 15px 0; width: 100%;
+  font-size: 17px; letter-spacing: 3px;
+  box-shadow: 0 6px 16px rgba(107,127,94,0.28);
+  transition: transform .12s, box-shadow .12s;
+}
+.btn-main:active { transform: scale(.97); }
+
+.btn-sticker {
+  display: inline-block; background: var(--yellow);
+  color: var(--ink); border: none; border-radius: 999px;
+  padding: 13px 30px; font-family: var(--font-play); font-size: 17px;
+  transform: rotate(-2deg);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+  transition: transform .12s;
+}
+.btn-sticker:active { transform: rotate(-2deg) scale(.96); }
+
+/* —— 卡片 —— */
+.card {
+  background: var(--paper); border-radius: 16px;
+  padding: 16px; box-shadow: var(--shadow); margin-bottom: 12px;
+}
+
+/* —— 手写注释 —— */
+.hand-note {
+  font-family: var(--font-hand); font-size: 14px;
+  color: var(--olive); transform: rotate(-1deg);
+  line-height: 1.5;
+}
+
+/* —— 区块标题 —— */
+.section-title {
+  font-family: var(--font-play); font-size: 15px;
+  color: var(--olive); letter-spacing: 2px; margin: 22px 0 10px;
+}
+
+/* —— 贴纸 chip —— */
+.chip {
+  display: inline-block; padding: 9px 14px; border-radius: 999px;
+  border: 1.5px solid var(--line); background: #fff; color: var(--ink);
+  margin: 0 8px 10px 0; font-size: 14px;
+  transition: all .15s;
+}
+.chip.active {
+  background: var(--sage); color: #fff; border-color: var(--sage);
+  box-shadow: 0 4px 10px rgba(143,169,143,0.4);
+}
+
+/* —— 手绘虚线 —— */
+.dashed { border: none; border-top: 2px dashed var(--sage); opacity: .5; margin: 12px 0; }
+
+/* —— 动画 —— */
+@keyframes floatUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+@keyframes bounce { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+.fade-enter-active, .fade-leave-active { transition: opacity .22s ease; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+.anim-item { animation: floatUp .4s ease both; }
+
+.muted { color: var(--muted); font-size: 12px; }

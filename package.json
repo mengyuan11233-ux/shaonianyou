@@ -1,0 +1,16 @@
+{
+  "name": "shaonianyou",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "少年游 - AI 智能旅行规划（技术验证）",
+  "scripts": {
+    "spike": "node spike.mjs",
+    "start": "node server/index.js",
+    "build": "cd web && npm run build"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.67.0"
+  }
+}
