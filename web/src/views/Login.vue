@@ -74,7 +74,7 @@ async function submit() {
     <button class="btn-main" style="margin-top: 22px" :disabled="loading" @click="submit">{{ btnText }}</button>
 
     <div class="switch muted" @click="toggle">
-      {{ mode === 'login' ? '还没有账号？点这里注册' : '已有账号？点这里登录' }}
+      {{ mode === 'login' ? '还没有账号？' : '已有账号？' }}<span class="link">点这里{{ mode === 'login' ? '注册' : '登录' }}</span>
     </div>
   </div>
 </template>
@@ -94,4 +94,5 @@ async function submit() {
 .sub { letter-spacing: 1px; }
 
 .switch { text-align: center; margin-top: 20px; letter-spacing: 1px; }
+.link { color: #1989fa; font-weight: 600; }
 </style>

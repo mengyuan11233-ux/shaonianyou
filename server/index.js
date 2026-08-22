@@ -13,6 +13,7 @@ import { getPoiDetail } from './tools.js';
 import { loadMemory, updateMemory, memoryToPrompt } from './memory.js';
 import { register, login, logout, phoneByToken, getTokenFromReq } from './auth.js';
 import { saveUserPlan, listUserPlans } from './plans.js';
+import { listCheckins, addCheckin, removeCheckin } from './checkins.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
@@ -119,6 +120,25 @@ const server = createServer(async (req, res) => {
   if (req.method === 'POST' && path === '/api/memory') {
     const m = updateMemory(currentUserId(req), await readBody(req));
     return json(res, 200, m);
+  }
+
+  // ===== 打卡手账（登录用户）=====
+  if (req.method === 'GET' && path === '/api/checkins') {
+    const phone = phoneByToken(getTokenFromReq(req));
+    if (!phone) return json(res, 401, { error: '未登录' });
+    return json(res, 200, listCheckins(phone));
+  }
+  if (req.method === 'POST' && path === '/api/checkins') {
+    const phone = phoneByToken(getTokenFromReq(req));
+    if (!phone) return json(res, 401, { error: '未登录' });
+    const r = await addCheckin(phone, await readBody(req));
+    return json(res, r.error ? 400 : 200, r);
+  }
+  if (req.method === 'DELETE' && path.startsWith('/api/checkins/')) {
+    const phone = phoneByToken(getTokenFromReq(req));
+    if (!phone) return json(res, 401, { error: '未登录' });
+    const id = decodeURIComponent(path.slice('/api/checkins/'.length));
+    return json(res, 200, removeCheckin(phone, id));
   }
 
   // POI 详情（前端地点详情弹窗）

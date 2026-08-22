@@ -51,10 +51,20 @@ export function saveMemory(userId, m) {
 export function updateMemory(userId = 'default', updates = {}) {
   const uid = sanitizeUserId(userId);
   const m = loadMemory(uid);
-  if (Array.isArray(updates.preferences)) m.preferences = [...new Set([...m.preferences, ...updates.preferences])];
-  if (Array.isArray(updates.dislikes)) m.dislikes = [...new Set([...m.dislikes, ...updates.dislikes])];
-  if (updates.budgetHabit) m.budgetHabit = updates.budgetHabit;
-  if (updates.travelStyle) m.travelStyle = updates.travelStyle;
+  // preferences/dislikes：默认累加（规划时逐渐积累），updates.replace=true 时整体覆盖（手动编辑）
+  if (Array.isArray(updates.preferences)) {
+    m.preferences = updates.replace
+      ? [...new Set(updates.preferences)]
+      : [...new Set([...m.preferences, ...updates.preferences])];
+  }
+  if (Array.isArray(updates.dislikes)) {
+    m.dislikes = updates.replace
+      ? [...new Set(updates.dislikes)]
+      : [...new Set([...m.dislikes, ...updates.dislikes])];
+  }
+  // 字符串字段：只要字段出现就写入（允许清空）
+  if (updates.budgetHabit !== undefined) m.budgetHabit = updates.budgetHabit;
+  if (updates.travelStyle !== undefined) m.travelStyle = updates.travelStyle;
   saveMemory(uid, m);
   return m;
 }
