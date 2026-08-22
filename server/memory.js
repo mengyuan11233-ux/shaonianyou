@@ -1,5 +1,7 @@
 // ============================================================
 // 少年游 · Memory（长期用户偏好，JSON 文件持久化，免数据库）
+// - 按用户隔离：data/users/{userId}/memory.json
+// - 未登录访客使用 userId = 'default'
 // ============================================================
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -8,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, '..', 'data');
-const MEMORY_FILE = join(DATA_DIR, 'memory.json');
+const LEGACY_MEMORY_FILE = join(DATA_DIR, 'memory.json');
 
 const DEFAULT = {
   userId: 'default',
@@ -19,25 +21,41 @@ const DEFAULT = {
   visitHistory: [],  // 历史行程记录
 };
 
-export function loadMemory() {
+function sanitizeUserId(userId) {
+  return String(userId || 'default').replace(/[^\w.-]/g, '_');
+}
+
+function memoryFile(userId) {
+  return join(DATA_DIR, 'users', userId, 'memory.json');
+}
+
+export function loadMemory(userId = 'default') {
+  const uid = sanitizeUserId(userId);
+  const file = memoryFile(uid);
   try {
-    if (existsSync(MEMORY_FILE)) return { ...DEFAULT, ...JSON.parse(readFileSync(MEMORY_FILE, 'utf8')) };
+    if (existsSync(file)) return { ...DEFAULT, userId: uid, ...JSON.parse(readFileSync(file, 'utf8')) };
   } catch {}
-  return { ...DEFAULT };
+  // 兼容旧的单用户 memory.json（仅 default 访客）
+  if (uid === 'default' && existsSync(LEGACY_MEMORY_FILE)) {
+    try { return { ...DEFAULT, ...JSON.parse(readFileSync(LEGACY_MEMORY_FILE, 'utf8')) }; } catch {}
+  }
+  return { ...DEFAULT, userId: uid };
 }
 
-export function saveMemory(m) {
-  mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(MEMORY_FILE, JSON.stringify(m, null, 2));
+export function saveMemory(userId, m) {
+  const uid = sanitizeUserId(userId);
+  mkdirSync(join(DATA_DIR, 'users', uid), { recursive: true });
+  writeFileSync(memoryFile(uid), JSON.stringify(m, null, 2));
 }
 
-export function updateMemory(updates = {}) {
-  const m = loadMemory();
+export function updateMemory(userId = 'default', updates = {}) {
+  const uid = sanitizeUserId(userId);
+  const m = loadMemory(uid);
   if (Array.isArray(updates.preferences)) m.preferences = [...new Set([...m.preferences, ...updates.preferences])];
   if (Array.isArray(updates.dislikes)) m.dislikes = [...new Set([...m.dislikes, ...updates.dislikes])];
   if (updates.budgetHabit) m.budgetHabit = updates.budgetHabit;
   if (updates.travelStyle) m.travelStyle = updates.travelStyle;
-  saveMemory(m);
+  saveMemory(uid, m);
   return m;
 }
 

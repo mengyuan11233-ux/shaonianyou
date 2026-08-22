@@ -1,10 +1,13 @@
 <script setup>
-const props = defineProps({ plan: Object });
-const emit = defineEmits(['explore', 'resume']);
+const props = defineProps({ plan: Object, user: Object });
+const emit = defineEmits(['explore', 'resume', 'login', 'mine']);
 </script>
 
 <template>
   <div class="home">
+    <button class="login-pill play" @click="emit(user ? 'mine' : 'login')">
+      {{ user ? '👤 我的' : '登录' }}
+    </button>
     <div class="stickers">
       <span class="sticker s1">✈️</span>
       <span class="sticker s2">🏔️</span>
@@ -41,7 +44,7 @@ const emit = defineEmits(['explore', 'resume']);
   max-width: 430px; margin: 0 auto;
   position: relative;
   display: flex; flex-direction: column; justify-content: center;
-  padding: 40px 28px;
+  padding: 40px 28px 96px;
   overflow: hidden;
   background:
     radial-gradient(90% 50% at 15% 12%, rgba(242,215,124,0.30), transparent 60%),
@@ -49,6 +52,13 @@ const emit = defineEmits(['explore', 'resume']);
     radial-gradient(70% 40% at 50% 90%, rgba(143,169,143,0.22), transparent 60%),
     var(--bg);
 }
+.login-pill {
+  position: absolute; top: 16px; right: 16px; z-index: 2;
+  background: #fff; color: var(--olive); border: 1.5px solid var(--sage);
+  border-radius: 999px; padding: 7px 16px; font-size: 14px;
+  box-shadow: var(--shadow); letter-spacing: 1px;
+}
+
 .stickers { position: absolute; inset: 0; pointer-events: none; }
 .sticker {
   position: absolute; font-size: 34px;

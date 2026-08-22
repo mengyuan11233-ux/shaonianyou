@@ -11,6 +11,8 @@ import { fileURLToPath } from 'node:url';
 import { planTrip, replanTrip } from './planner.js';
 import { getPoiDetail } from './tools.js';
 import { loadMemory, updateMemory, memoryToPrompt } from './memory.js';
+import { register, login, logout, phoneByToken, getTokenFromReq } from './auth.js';
+import { saveUserPlan, listUserPlans } from './plans.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
@@ -51,6 +53,12 @@ async function readBody(req) {
   try { return JSON.parse(body || '{}'); } catch { return {}; }
 }
 
+// 当前请求对应的用户：登录用户用手机号，未登录用 'default'
+function currentUserId(req) {
+  const phone = phoneByToken(getTokenFromReq(req));
+  return phone || 'default';
+}
+
 // 提供前端静态文件（web/dist），找不到则回退到 index.html（SPA）
 async function serveStatic(req, res, pathname) {
   if (req.method !== 'GET') return false;
@@ -85,10 +93,31 @@ const server = createServer(async (req, res) => {
   // 健康检查
   if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true });
 
-  // 读取 / 更新 Memory
-  if (req.method === 'GET' && path === '/api/memory') return json(res, 200, loadMemory());
+  // ===== 账号：注册 / 登录 / 退出 / 当前用户 =====
+  if (req.method === 'POST' && path === '/api/auth/register') {
+    const { phone, password } = await readBody(req);
+    const r = register(phone, password);
+    return json(res, r.error ? 400 : 200, r);
+  }
+  if (req.method === 'POST' && path === '/api/auth/login') {
+    const { phone, password } = await readBody(req);
+    const r = login(phone, password);
+    return json(res, r.error ? 400 : 200, r);
+  }
+  if (req.method === 'POST' && path === '/api/auth/logout') {
+    logout(getTokenFromReq(req));
+    return json(res, 200, { ok: true });
+  }
+  if (req.method === 'GET' && path === '/api/auth/me') {
+    const phone = phoneByToken(getTokenFromReq(req));
+    if (!phone) return json(res, 401, { error: '未登录' });
+    return json(res, 200, { phone, memory: loadMemory(phone), plans: listUserPlans(phone) });
+  }
+
+  // 读取 / 更新 Memory（登录用户按手机号隔离，未登录用 default）
+  if (req.method === 'GET' && path === '/api/memory') return json(res, 200, loadMemory(currentUserId(req)));
   if (req.method === 'POST' && path === '/api/memory') {
-    const m = updateMemory(await readBody(req));
+    const m = updateMemory(currentUserId(req), await readBody(req));
     return json(res, 200, m);
   }
 
@@ -99,11 +128,12 @@ const server = createServer(async (req, res) => {
     return json(res, detail.error ? 404 : 200, detail);
   }
 
-  // 规划（SSE 流式进度）
+  // 规划（SSE 流式进度；登录用户自动保存行程）
   if (req.method === 'POST' && path === '/api/plan') {
     const { request } = await readBody(req);
     if (!request) return json(res, 400, { error: '缺少 request 字段' });
-    const memory = loadMemory();
+    const phone = phoneByToken(getTokenFromReq(req));
+    const memory = loadMemory(phone || 'default');
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
@@ -114,6 +144,7 @@ const server = createServer(async (req, res) => {
         memoryText: memoryToPrompt(memory),
         onProgress: (e) => sendSSE(res, e),
       });
+      if (phone) saveUserPlan(phone, plan);   // 登录用户 → 自动保存到云端
       sendSSE(res, { type: 'done', plan, issues });
     } catch (err) {
       sendSSE(res, { type: 'error', message: err.message });
@@ -123,11 +154,12 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // 重新规划（SSE 流式进度）
+  // 重新规划（SSE 流式进度；登录用户自动保存更新后的行程）
   if (req.method === 'POST' && path === '/api/replan') {
     const { plan, message } = await readBody(req);
     if (!plan || !message) return json(res, 400, { error: '缺少 plan 或 message 字段' });
-    const memory = loadMemory();
+    const phone = phoneByToken(getTokenFromReq(req));
+    const memory = loadMemory(phone || 'default');
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
@@ -138,6 +170,7 @@ const server = createServer(async (req, res) => {
         memoryText: memoryToPrompt(memory),
         onProgress: (e) => sendSSE(res, e),
       });
+      if (phone) saveUserPlan(phone, newPlan);   // 登录用户 → 自动保存更新
       sendSSE(res, { type: 'done', plan: newPlan, issues });
     } catch (err) {
       sendSSE(res, { type: 'error', message: err.message });

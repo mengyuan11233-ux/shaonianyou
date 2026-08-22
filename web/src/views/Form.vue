@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed } from 'vue';
+import { authHeaders } from '../auth.js';
 
 const emit = defineEmits(['submit', 'back']);
 
@@ -75,7 +76,7 @@ async function submit() {
   try {
     await fetch('/api/memory', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         preferences: prefs.value,
         budgetHabit: budget.value,

@@ -1,8 +1,10 @@
 // 调用后端 SSE 接口，流式解析进度事件
+import { authHeaders } from './auth.js';
+
 export async function streamPlan(request, onEvent) {
   const res = await fetch('/api/plan', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ request }),
   });
   if (!res.ok || !res.body) throw new Error(`请求失败（${res.status}）`);
@@ -29,7 +31,7 @@ export async function streamPlan(request, onEvent) {
 export async function replan(plan, message, onEvent) {
   const res = await fetch('/api/replan', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ plan, message }),
   });
   if (!res.ok || !res.body) throw new Error(`请求失败（${res.status}）`);
