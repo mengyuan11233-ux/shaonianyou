@@ -295,7 +295,12 @@ function fmtDate(s) {
   border-radius: 999px; padding: 6px 16px; font-size: 13px;
 }
 
-.pop { padding: 22px 18px 30px; }
+.pop {
+  padding: 22px 18px 30px;
+  max-height: 80vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
 .pop-title { font-size: 24px; margin-bottom: 4px; }
 .date-row { display: flex; gap: 10px; margin-top: 8px; }
 .date-input {

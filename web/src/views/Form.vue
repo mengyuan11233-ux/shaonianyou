@@ -9,7 +9,7 @@ const start = ref('');
 const end = ref('');
 const people = ref(2);
 const relation = ref('朋友');
-const budget = ref('¥2000-5000');
+const budget = ref('');
 const prefs = ref([]);
 const nl = ref('');
 
@@ -67,21 +67,25 @@ async function submit() {
     `帮我规划一个${dest.value}${d}日游。`,
     `日期：${start.value || '待定'} 至 ${end.value || '待定'}`,
     `人数：${people.value}人，${relation.value}`,
-    `预算：${budget.value}`,
-    `偏好：${prefs.value.join('、') || '无特别偏好'}`,
-    `额外需求：${nl.value || '无'}`,
-  ].join('\n');
+  ];
+  if (budget.value) req.push(`预算：${budget.value}`);
+  req.push(`偏好：${prefs.value.join('、') || '无特别偏好'}`);
+  req.push(`额外需求：${nl.value || '无'}`);
 
   // 保存用户偏好到记忆（静默，失败不阻塞规划）
   try {
+    const mem = {
+      preferences: prefs.value,
+    };
+    // 只有用户明确选择了预算，才记录预算习惯（避免默认值被误写进手账）
+    if (budget.value) mem.budgetHabit = budget.value;
+    const style = prefs.value.includes('特种兵') ? '特种兵' : prefs.value.includes('松弛休闲') ? '松弛休闲' : '';
+    if (style) mem.travelStyle = style;
+
     await fetch('/api/memory', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({
-        preferences: prefs.value,
-        budgetHabit: budget.value,
-        travelStyle: prefs.value.includes('特种兵') ? '特种兵' : prefs.value.includes('松弛休闲') ? '松弛休闲' : '',
-      }),
+      body: JSON.stringify(mem),
     });
   } catch {}
 

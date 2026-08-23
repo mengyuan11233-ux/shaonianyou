@@ -373,7 +373,12 @@ async function clickItem(idx) {
   box-shadow: 0 6px 18px rgba(107,127,94,0.4);
   animation: bounce 1.4s ease-in-out infinite;
 }
-.ask-panel { padding: 22px 18px 28px; }
+.ask-panel {
+  padding: 22px 18px 28px;
+  max-height: 80vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
 .ask-title { font-size: 24px; margin-bottom: 4px; }
 
 .detail-photo { text-align: center; margin-bottom: 12px; }
